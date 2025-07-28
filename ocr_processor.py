@@ -35,6 +35,9 @@ class ClaudeProcessor:
     
     async def analyze_document(self, image_bytes: bytes) -> Dict[str, Any]:
         """Анализирует документ через Claude API"""
+        if not self.client:
+            return {"error": "Claude API не инициализирован. Проверьте ANTHROPIC_API_KEY."}
+        
         try:
             # Кодируем изображение
             base64_image = self.encode_image(image_bytes)

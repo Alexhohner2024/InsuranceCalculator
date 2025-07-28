@@ -1,18 +1,8 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "bot.py",
-      "use": "@vercel/python"
+  "functions": {
+    "api/webhook.py": {
+      "runtime": "@vercel/python"
     }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "bot.py"
-    }
-  ],
-  "env": {
-    "PYTHONPATH": "./"
   }
 }

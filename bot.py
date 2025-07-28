@@ -1,385 +1,204 @@
 import os
-import asyncio
+import re
 import json
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from excel_handler import TariffHandler
-from ocr_processor import ClaudeProcessor
+import asyncio
+from typing import Dict, Any
 
-# Токен бота (будет задан через переменные окружения)
-BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-
-# Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# Инициализация обработчиков
-tariff_handler = TariffHandler()
-claude_processor = ClaudeProcessor()
-
-# Хранение контекста пользователей
-user_contexts = {}
-
-class UserContext:
+# Простая обработка без aiogram - он конфликтует с Vercel
+class SimpleBot:
     def __init__(self):
-        self.vehicle_data = {}
-        self.waiting_for = None  # 'engine_volume', 'brand', 'model'
-        self.conversation_state = 'idle'  # 'idle', 'collecting_data', 'confirming'
-        self.media_group_photos = []
+        self.bot_token = os.getenv('BOT_TOKEN', '')
+        self.user_contexts = {}
         
-    def reset(self):
-        self.vehicle_data = {}
-        self.waiting_for = None
-        self.conversation_state = 'idle'
-        self.media_group_photos = []
-
-def get_user_context(user_id: int) -> UserContext:
-    if user_id not in user_contexts:
-        user_contexts[user_id] = UserContext()
-    return user_contexts[user_id]
-
-@dp.message(Command('start'))
-async def start_command(message: types.Message):
-    """Команда /start"""
-    welcome_text = """
-🚗 Привет! Я помогу рассчитать стоимость ОСЦПВ (автогражданки).
-
-💬 Просто напиши мне:
-• "BMW X3 2000 см³" 
-• "Toyota Camry 1800"
-• Или пришли фото техпаспорта
-
-🔍 Я умею понимать обычную речь - пиши как удобно!
-
-Что будем рассчитывать?
-"""
-    context = get_user_context(message.from_user.id)
-    context.reset()
-    await message.answer(welcome_text)
-
-@dp.message(Command('help'))
-async def help_command(message: types.Message):
-    """Команда /help"""
-    help_text = """
-ℹ️ Как пользоваться ботом:
-
-💭 Пиши естественно:
-• "хочу рассчитать для БМВ Х3"
-• "объем двигателя 1998"
-• "это дизель 2.0 литра"
-
-📸 Или пришли фото техпаспорта - я сам все найду
-
-🏷️ Покрытие ОСЦПВ:
-• Жизнь и здоровье: до 5 000 000 грн
-• Имущество: до 1 250 000 грн
-
-Просто начни писать - я пойму! 😊
-"""
-    await message.answer(help_text)
-
-@dp.message(lambda message: message.media_group_id)
-async def process_media_group(message: types.Message):
-    """Обработка группы фотографий"""
-    context = get_user_context(message.from_user.id)
+        # Тарифы напрямую в коде (проще чем Excel на Vercel)
+        self.tariffs = {
+            'B1': {'name': 'до 1600 см³', 'price': 1959},
+            'B2': {'name': '1601-2000 см³', 'price': 2527},
+            'B3': {'name': '2001-3000 см³', 'price': 2585},
+            'B4': {'name': 'свыше 3000 см³', 'price': 3349}
+        }
+        
+        self.car_brands = [
+            'BMW', 'MERCEDES', 'AUDI', 'VOLKSWAGEN', 'TOYOTA', 'HONDA', 'NISSAN',
+            'HYUNDAI', 'KIA', 'FORD', 'CHEVROLET', 'OPEL', 'PEUGEOT', 'RENAULT',
+            'LEXUS', 'DAEWOO', 'MAZDA', 'SUBARU', 'MITSUBISHI', 'LADA'
+        ]
     
-    # Собираем фото из медиагруппы
-    if not hasattr(context, 'media_group_buffer'):
-        context.media_group_buffer = []
+    def get_category(self, engine_volume):
+        """Определяет категорию по объему двигателя"""
+        try:
+            volume = int(engine_volume)
+            if volume <= 1600:
+                return 'B1'
+            elif volume <= 2000:
+                return 'B2'
+            elif volume <= 3000:
+                return 'B3'
+            else:
+                return 'B4'
+        except:
+            return 'B2'
     
-    context.media_group_buffer.append(message.photo[-1])
-    
-    # Ждем 2 секунды, чтобы собрать все фото
-    await asyncio.sleep(2)
-    
-    if len(context.media_group_buffer) > 0:
-        await process_multiple_photos(message, context.media_group_buffer)
-        context.media_group_buffer = []
-
-@dp.message(lambda message: message.content_type == 'photo')
-async def process_single_photo(message: types.Message):
-    """Обработка одного фото"""
-    context = get_user_context(message.from_user.id)
-    processing_msg = await message.answer("🔍 Анализирую документ...")
-    
-    try:
-        # Скачиваем фото
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        file_data = await bot.download_file(file_info.file_path)
+    def parse_text(self, text):
+        """Парсит текст пользователя"""
+        text = text.upper().strip()
+        result = {'brand': None, 'model': None, 'engine_volume': None}
         
-        # Анализируем через Claude
-        result = await claude_processor.analyze_document(file_data.read())
+        # Поиск объема двигателя
+        volume_patterns = [
+            r'(\d{3,4})\s*(?:СМ|CM|КУБОВ|КУБ)',
+            r'(\d{1,2})[.,](\d{3})',
+            r'(\d{3,4})(?=\s|$)'
+        ]
         
-        if "error" in result:
-            await processing_msg.edit_text(f"😔 {result['error']}\n\nПопробуй написать данные текстом или пришли более четкое фото.")
-            return
+        for pattern in volume_patterns:
+            match = re.search(pattern, text)
+            if match:
+                if len(match.groups()) == 2:
+                    volume = match.group(1) + match.group(2)
+                else:
+                    volume = match.group(1)
+                
+                if 500 <= int(volume) <= 8000:
+                    result['engine_volume'] = volume
+                    break
         
-        # Сохраняем данные
-        context.vehicle_data.update(result)
-        context.conversation_state = 'collecting_data'
+        # Поиск марки
+        for brand in self.car_brands:
+            if brand in text:
+                result['brand'] = brand
+                # Ищем модель после марки
+                brand_index = text.find(brand)
+                text_after = text[brand_index + len(brand):].strip()
+                model_match = re.search(r'^[А-ЯA-Z0-9\-]+', text_after)
+                if model_match:
+                    model = model_match.group()
+                    if not re.match(r'^\d{3,4}$', model):
+                        result['model'] = model
+                break
         
-        # Показываем что нашли и проверяем что нужно еще
-        response = format_recognized_data(result)
-        missing = get_missing_critical_data(result)
-        
-        if missing:
-            response += f"\n\n❓ {missing}"
-            context.waiting_for = get_next_required_field(result)
-        else:
-            # Все данные есть, рассчитываем
-            response += "\n\n" + calculate_and_format_result(context.vehicle_data)
-            context.reset()
-        
-        await processing_msg.edit_text(response)
-        
-    except Exception as e:
-        await processing_msg.edit_text(f"😔 Что-то пошло не так: {str(e)}\n\nПопробуй еще раз или напиши данные текстом.")
-
-async def process_multiple_photos(message: types.Message, photos: list):
-    """Обработка нескольких фото"""
-    context = get_user_context(message.from_user.id)
-    processing_msg = await message.answer("🔍 Анализирую документы...")
-    
-    try:
-        # Скачиваем все фото
-        images = []
-        for photo in photos:
-            file_info = await bot.get_file(photo.file_id)
-            file_data = await bot.download_file(file_info.file_path)
-            images.append(file_data.read())
-        
-        # Анализируем через Claude
-        result = await claude_processor.analyze_multiple_images(images)
-        
-        if "error" in result:
-            await processing_msg.edit_text(f"😔 {result['error']}\n\nПопробуй написать данные текстом.")
-            return
-        
-        # Сохраняем данные
-        context.vehicle_data.update(result)
-        context.conversation_state = 'collecting_data'
-        
-        # Показываем результат
-        response = format_recognized_data(result)
-        missing = get_missing_critical_data(result)
-        
-        if missing:
-            response += f"\n\n❓ {missing}"
-            context.waiting_for = get_next_required_field(result)
-        else:
-            response += "\n\n" + calculate_and_format_result(context.vehicle_data)
-            context.reset()
-        
-        await processing_msg.edit_text(response)
-        
-    except Exception as e:
-        await processing_msg.edit_text(f"😔 Ошибка обработки: {str(e)}")
-
-@dp.message()
-async def process_text_message(message: types.Message):
-    """Обработка текстовых сообщений"""
-    user_id = message.from_user.id
-    context = get_user_context(user_id)
-    text = message.text.strip()
-    
-    # Проверяем на вежливые фразы и благодарности
-    if is_polite_response(text):
-        await handle_polite_response(message, context, text)
-        return
-    
-    # Проверяем на команды начала нового расчета
-    if is_new_calculation_request(text):
-        context.reset()
-        await message.answer("🚗 Отлично! Какой автомобиль будем рассчитывать?")
-        return
-    
-    # Основная логика обработки
-    if context.conversation_state == 'idle':
-        # Начинаем новый расчет
-        await start_new_calculation(message, context, text)
-    else:
-        # Продолжаем сбор данных
-        await continue_data_collection(message, context, text)
-
-async def start_new_calculation(message: types.Message, context: UserContext, text: str):
-    """Начинаем новый расчет"""
-    # Парсим входящий текст
-    parsed_data = claude_processor.parse_text_input(text)
-    context.vehicle_data.update({k: v for k, v in parsed_data.items() if v})
-    context.conversation_state = 'collecting_data'
-    
-    # Проверяем что получили
-    if parsed_data.get('engine_volume'):
-        # Есть объем - можем рассчитывать
-        result = calculate_and_format_result(context.vehicle_data)
-        await message.answer(result)
-        context.reset()
-    else:
-        # Нужны дополнительные данные
-        response = format_recognized_data(context.vehicle_data)
-        missing = get_missing_critical_data(context.vehicle_data)
-        response += f"\n\n❓ {missing}"
-        context.waiting_for = 'engine_volume'
-        await message.answer(response)
-
-async def continue_data_collection(message: types.Message, context: UserContext, text: str):
-    """Продолжаем сбор данных"""
-    # Извлекаем новые данные из сообщения
-    context.vehicle_data = claude_processor.extract_missing_data(context.vehicle_data, text)
-    
-    # Проверяем что теперь есть
-    if context.vehicle_data.get('engine_volume'):
-        # Достаточно данных для расчета
-        result = calculate_and_format_result(context.vehicle_data)
-        await message.answer(result)
-        context.reset()
-    else:
-        # Все еще нужен объем двигателя
-        response = "🤔 Понял"
-        if context.vehicle_data.get('brand') or context.vehicle_data.get('model'):
-            response += f", {format_current_data(context.vehicle_data)}"
-        response += ".\n\n❓ Какой объем двигателя в см³?"
-        await message.answer(response)
-
-def is_polite_response(text: str) -> bool:
-    """Проверяет на вежливые ответы"""
-    polite_words = ['спасибо', 'благодарю', 'дякую', 'ок', 'хорошо', 'отлично', 'понятно', 'ясно', 'да', 'нет']
-    return any(word in text.lower() for word in polite_words)
-
-async def handle_polite_response(message: types.Message, context: UserContext, text: str):
-    """Обрабатывает вежливые ответы"""
-    text_lower = text.lower()
-    
-    if any(word in text_lower for word in ['спасибо', 'благодарю', 'дякую']):
-        await message.answer("😊 Пожалуйста! Обращайся, если нужен еще расчет.")
-        context.reset()
-    elif any(word in text_lower for word in ['ок', 'хорошо', 'отлично', 'понятно', 'ясно']):
-        if context.waiting_for:
-            await message.answer("👍 Жду нужные данные!")
-        else:
-            await message.answer("😊 Что будем рассчитывать?")
-    elif 'да' in text_lower:
-        await message.answer("👍 Продолжаем!")
-    elif 'нет' in text_lower:
-        await message.answer("🤔 Что именно не так? Давай исправим!")
-
-def is_new_calculation_request(text: str) -> bool:
-    """Проверяет запрос нового расчета"""
-    new_calc_words = ['новый', 'еще', 'другой', 'рассчитать', 'расчет', 'другая машина', 'другое авто']
-    return any(word in text.lower() for word in new_calc_words)
-
-def format_recognized_data(data: dict) -> str:
-    """Форматирует распознанные данные"""
-    parts = []
-    if data.get('brand'):
-        parts.append(data['brand'])
-    if data.get('model'):
-        parts.append(data['model'])
-    if data.get('year'):
-        parts.append(f"{data['year']} года")
-    
-    if parts:
-        result = f"🔍 Понял: {' '.join(parts)}"
-        if data.get('engine_volume'):
-            result += f", {data['engine_volume']} см³"
         return result
-    elif data.get('engine_volume'):
-        return f"🔍 Объем двигателя: {data['engine_volume']} см³"
-    else:
-        return "🔍 Анализирую данные..."
-
-def format_current_data(data: dict) -> str:
-    """Форматирует текущие данные"""
-    parts = []
-    if data.get('brand'):
-        parts.append(data['brand'])
-    if data.get('model'):
-        parts.append(data['model'])
-    return ' '.join(parts) if parts else "автомобиль"
-
-def get_missing_critical_data(data: dict) -> str:
-    """Определяет какие критичные данные отсутствуют"""
-    if not data.get('engine_volume'):
-        return "Какой объем двигателя в см³?"
-    return ""
-
-def get_next_required_field(data: dict) -> str:
-    """Определяет следующее требуемое поле"""
-    if not data.get('engine_volume'):
-        return 'engine_volume'
-    return None
-
-def calculate_and_format_result(vehicle_data: dict) -> str:
-    """Рассчитывает и форматирует результат"""
-    try:
-        engine_volume = vehicle_data.get('engine_volume')
+    
+    def format_result(self, data):
+        """Форматирует результат расчета"""
+        engine_volume = data.get('engine_volume')
         if not engine_volume:
-            return "❌ Не хватает данных для расчета. Укажи объем двигателя."
+            return "❓ Не указан объем двигателя. Напиши например: 'BMW X3 1998 см³'"
         
-        # Определяем категорию
-        category = tariff_handler.get_car_category(engine_volume)
-        price = tariff_handler.get_price(category, age_over_30=True)
+        category = self.get_category(engine_volume)
+        price = self.tariffs[category]['price']
         
-        if not price:
-            return "❌ Не удалось определить тариф для данного объема двигателя."
-        
-        # Форматируем название автомобиля
-        brand = vehicle_data.get('brand', 'Автомобиль')
-        model = vehicle_data.get('model', '')
-        year = vehicle_data.get('year', '')
-        
-        # Преобразуем объем в литры
+        brand = data.get('brand', 'Автомобиль')
+        model = data.get('model', '')
         volume_liters = f"{float(engine_volume)/1000:.3f} л"
         
-        vehicle_name = f"{brand} {model} {year}".strip()
-        vehicle_name += f", {volume_liters} бензин"
+        vehicle_name = f"{brand} {model}".strip()
+        if volume_liters:
+            vehicle_name += f", {volume_liters} бензин"
         
-        result = f"""✅ Ціна автоцивілки (ОСЦПВ) для {vehicle_name}:
+        return f"""✅ Ціна автоцивілки (ОСЦПВ) для {vehicle_name}:
 🩺 Покриття: життя і здоров'я потерпілих до 5 000 000 грн
 🚗 Покриття: майно потерпілих до 1 250 000 грн
 👤 Діє для водіїв віком: більше 30 років
 💰 Ціна: {price} грн"""
+    
+    async def send_message(self, chat_id, text):
+        """Отправляет сообщение через Telegram API"""
+        import aiohttp
         
-        return result
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        data = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': 'HTML'
+        }
         
-    except Exception as e:
-        return f"❌ Ошибка расчета: {str(e)}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data) as response:
+                return await response.json()
+    
+    async def process_update(self, update_data):
+        """Обрабатывает обновление от Telegram"""
+        try:
+            message = update_data.get('message', {})
+            if not message:
+                return
+            
+            chat_id = message['chat']['id']
+            text = message.get('text', '')
+            
+            # Команды
+            if text == '/start':
+                response = """🚗 Привет! Я помогу рассчитать ОСЦПВ.
+
+💬 Напиши данные автомобиля:
+• "BMW X3 1998 см³"
+• "Toyota Camry 1800"
+
+Что рассчитываем?"""
+            
+            elif text == '/help':
+                response = """ℹ️ Как использовать:
+
+💭 Пиши естественно:
+• "BMW X3 объем 2000"
+• "хочу для Тойоты, 1800 кубов"
+
+🏷️ Покрытие ОСЦПВ:
+• Жизнь: до 5 000 000 грн
+• Имущество: до 1 250 000 грн
+
+Бот понимает обычную речь! 😊"""
+            
+            else:
+                # Обрабатываем текст
+                parsed = self.parse_text(text)
+                
+                if parsed['engine_volume']:
+                    # Есть объем - рассчитываем
+                    response = self.format_result(parsed)
+                elif any(word in text.lower() for word in ['спасибо', 'дякую', 'благодарю']):
+                    response = "😊 Пожалуйста! Обращайтесь для новых расчетов."
+                elif any(word in text.lower() for word in ['привет', 'здравствуй', 'добрый']):
+                    response = "👋 Привет! Какой автомобиль будем рассчитывать?"
+                else:
+                    if parsed['brand']:
+                        response = f"🔍 Понял: {parsed['brand']} {parsed.get('model', '')}\n\n❓ Какой объем двигателя в см³?"
+                    else:
+                        response = "🤔 Не понял данные автомобиля.\n\n💡 Напиши например: 'BMW X3 1998 см³'"
+            
+            # Отправляем ответ
+            await self.send_message(chat_id, response)
+            
+        except Exception as e:
+            print(f"Ошибка обработки: {e}")
+
+# Создаем экземпляр бота
+simple_bot = SimpleBot()
 
 # Главная функция для Vercel
-def handler(request, context=None):
-    """Главная функция для Vercel"""
+def handler(request):
+    """Простая функция для обработки webhook"""
     import asyncio
-    import json
     
     try:
         # Получаем тело запроса
         if hasattr(request, 'get_json'):
-            # Flask-style request
             body = request.get_json()
-        elif hasattr(request, 'json'):
-            # FastAPI-style request
-            body = request.json
         else:
-            # Raw request
-            if hasattr(request, 'body'):
-                body_str = request.body
+            # Для разных типов запросов
+            body_content = getattr(request, 'body', getattr(request, 'data', '{}'))
+            if isinstance(body_content, bytes):
+                body_content = body_content.decode('utf-8')
+            if isinstance(body_content, str):
+                body = json.loads(body_content)
             else:
-                body_str = request
-            
-            if isinstance(body_str, str):
-                body = json.loads(body_str)
-            else:
-                body = body_str
-        
-        # Создаем Update объект
-        update = types.Update(**body)
+                body = body_content
         
         # Запускаем обработку
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(dp.feed_update(bot, update))
+        loop.run_until_complete(simple_bot.process_update(body))
         loop.close()
         
         return {
@@ -389,21 +208,12 @@ def handler(request, context=None):
         }
         
     except Exception as e:
+        print(f"Handler error: {e}")
         return {
             "statusCode": 500,
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps({"error": str(e)})
         }
 
-# Для совместимости с разными платформами
+# Для совместимости
 app = handler
-
-# Для локального тестирования
-if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    
-    async def main():
-        await dp.start_polling(bot)
-    
-    asyncio.run(main())

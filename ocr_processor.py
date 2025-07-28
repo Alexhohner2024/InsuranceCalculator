@@ -1,14 +1,18 @@
-
-import cv2
-import pytesseract
+import base64
 import re
-from PIL import Image
-import numpy as np
+import json
+from anthropic import Anthropic
+import os
+from typing import Optional, Dict, Any
 
-class OCRProcessor:
+class ClaudeProcessor:
     def __init__(self):
-        # Настройки Tesseract для украинского и русского языков
-        self.tesseract_config = '--oem 3 --psm 6 -l ukr+rus+eng'
+        # Инициализация Claude API
+        api_key = os.getenv('ANTHROPIC_API_KEY')
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY не найден в переменных окружения")
+        
+        self.client = Anthropic(api_key=api_key)
         
         # Известные марки автомобилей для валидации
         self.car_brands = [
@@ -17,151 +21,166 @@ class OCRProcessor:
             'CITROEN', 'FIAT', 'SKODA', 'SEAT', 'MAZDA', 'SUBARU', 'MITSUBISHI',
             'LEXUS', 'INFINITI', 'ACURA', 'VOLVO', 'SAAB', 'JAGUAR', 'LAND ROVER',
             'PORSCHE', 'MINI', 'ALFA ROMEO', 'LADA', 'VAZ', 'GAZ', 'UAZ', 'ZAZ',
-            'DAEWOO', 'SUZUKI', 'ISUZU', 'DACIA', 'LANCIA'
+            'DAEWOO', 'SUZUKI', 'ISUZU', 'DACIA', 'LANCIA', 'CHERY', 'GEELY'
         ]
     
-    def preprocess_image(self, image_bytes):
-        """Предобработка изображения для улучшения OCR"""
-        try:
-            # Конвертируем bytes в numpy array
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            # Конвертируем в серый
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            # Увеличиваем контрастность
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(gray)
-            
-            # Убираем шум
-            denoised = cv2.medianBlur(enhanced, 3)
-            
-            return denoised
-        except Exception as e:
-            print(f"Ошибка предобработки: {e}")
-            return None
+    def encode_image(self, image_bytes: bytes) -> str:
+        """Кодирует изображение в base64"""
+        return base64.b64encode(image_bytes).decode('utf-8')
     
-    def extract_text(self, image_bytes):
-        """Извлекает текст из изображения"""
+    async def analyze_document(self, image_bytes: bytes) -> Dict[str, Any]:
+        """Анализирует документ через Claude API"""
         try:
-            processed_img = self.preprocess_image(image_bytes)
-            if processed_img is None:
-                return ""
+            # Кодируем изображение
+            base64_image = self.encode_image(image_bytes)
             
-            # OCR распознавание
-            text = pytesseract.image_to_string(processed_img, config=self.tesseract_config)
-            return text.upper()  # Приводим к верхнему регистру для удобства
+            # Создаем промпт для анализа техпаспорта
+            prompt = """
+Проанализируй украинский техпаспорт на изображении и извлеки данные о транспортном средстве.
+
+Верни результат в формате JSON с полями:
+{
+  "brand": "марка автомобиля (например BMW, TOYOTA)",
+  "model": "модель (например X3, Camry)", 
+  "year": "год выпуска (4 цифры)",
+  "engine_volume": "объем двигателя в см³ (только цифры, например 1998)",
+  "confidence": "уверенность в правильности данных от 0 до 100"
+}
+
+Важные моменты:
+- Ищи объем двигателя рядом с полями P.1, Capacity, "см³", "см3"
+- Марка может быть в полях D.1, Make, Марка
+- Модель в полях D.2, Type, Тип
+- Год в полях B.2, Year, Рік випуску
+- Если какое-то поле не найдено, укажи null
+- Объем двигателя критично важен для расчета страховки
+
+Верни только JSON, без дополнительного текста.
+            """
+            
+            # Отправляем запрос к Claude
+            response = self.client.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=300,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": base64_image
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ]
+            )
+            
+            # Парсим ответ
+            response_text = response.content[0].text.strip()
+            
+            # Извлекаем JSON из ответа
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                return result
+            else:
+                return {"error": "Не удалось получить структурированный ответ от API"}
+                
+        except json.JSONDecodeError as e:
+            return {"error": f"Ошибка парсинга JSON: {str(e)}"}
         except Exception as e:
-            print(f"Ошибка OCR: {e}")
-            return ""
+            return {"error": f"Ошибка API: {str(e)}"}
     
-    def extract_vehicle_data(self, text):
-        """Извлекает данные о ТС из распознанного текста"""
-        data = {
-            'brand': None,
-            'model': None,
-            'year': None,
-            'engine_volume': None,
-            'fuel_type': None
+    async def analyze_multiple_images(self, images: list) -> Dict[str, Any]:
+        """Анализ нескольких изображений (обе стороны техпаспорта)"""
+        all_data = {}
+        best_confidence = 0
+        
+        for i, image_bytes in enumerate(images):
+            result = await self.analyze_document(image_bytes)
+            
+            if "error" not in result:
+                confidence = result.get("confidence", 0)
+                if confidence > best_confidence:
+                    all_data = result
+                    best_confidence = confidence
+                else:
+                    # Дополняем данные из других фото
+                    for key, value in result.items():
+                        if key != "confidence" and value and not all_data.get(key):
+                            all_data[key] = value
+        
+        return all_data if all_data else {"error": "Не удалось извлечь данные ни с одного изображения"}
+    
+    def parse_text_input(self, text: str) -> Dict[str, Any]:
+        """Парсит текстовый ввод пользователя"""
+        text = text.upper().strip()
+        result = {
+            "brand": None,
+            "model": None,
+            "year": None,
+            "engine_volume": None,
+            "source": "text_input"
         }
         
-        # Поиск года (4 цифры от 1990 до 2025)
-        year_match = re.search(r'\b(19[9][0-9]|20[0-2][0-9])\b', text)
-        if year_match:
-            data['year'] = year_match.group(1)
-        
         # Поиск объема двигателя
-        # Варианты: "1998", "1.998", "1,998" + "см3" или рядом с "P.1"
-        engine_patterns = [
-            r'(\d{3,4})\s*СМ',  # 1998 СМ
-            r'(\d{1,2})[.,](\d{3})\s*СМ',  # 1.998 СМ или 1,998 СМ
-            r'P\.1\s*(\d{3,4})',  # P.1 1998
-            r'CAPACITY.*?(\d{3,4})',  # после слова CAPACITY
-            r'(\d{3,4})\s*CM'  # английский вариант
+        volume_patterns = [
+            r'(\d{3,4})\s*(?:СМ|CM|КУБОВ|КУБ)',  # 1998 см³, 2000 кубов
+            r'(\d{1,2})[.,](\d{3})\s*(?:Л|L)',    # 1.998 л, 2,000 л
+            r'(\d{3,4})\s*(?:СС|CC)',             # 1998 сс
+            r'(\d{3,4})(?=\s|$)'                  # просто цифры 1998
         ]
         
-        for pattern in engine_patterns:
+        for pattern in volume_patterns:
             match = re.search(pattern, text)
             if match:
-                if len(match.groups()) == 2:  # для паттерна с точкой/запятой
-                    data['engine_volume'] = match.group(1) + match.group(2)
+                if len(match.groups()) == 2:  # для паттерна с точкой
+                    volume = match.group(1) + match.group(2)
                 else:
-                    data['engine_volume'] = match.group(1)
-                break
+                    volume = match.group(1)
+                
+                # Проверяем, что это разумный объем двигателя
+                if 500 <= int(volume) <= 8000:
+                    result["engine_volume"] = volume
+                    break
         
         # Поиск марки автомобиля
         for brand in self.car_brands:
             if brand in text:
-                data['brand'] = brand
-                break
-        
-        # Поиск модели (после марки или в определенных полях)
-        if data['brand']:
-            # Ищем текст после марки
-            brand_index = text.find(data['brand'])
-            if brand_index != -1:
-                text_after_brand = text[brand_index + len(data['brand']):brand_index + len(data['brand']) + 50]
-                model_match = re.search(r'([A-Z0-9]{2,15})', text_after_brand.strip())
+                result["brand"] = brand
+                # Ищем модель после марки
+                brand_index = text.find(brand)
+                text_after_brand = text[brand_index + len(brand):].strip()
+                model_match = re.search(r'^[А-ЯA-Z0-9\-]+', text_after_brand)
                 if model_match:
-                    potential_model = model_match.group(1)
+                    potential_model = model_match.group()
                     # Исключаем года и объемы
-                    if not re.match(r'^(19|20)\d{2}$', potential_model) and not re.match(r'^\d{3,4}$', potential_model):
-                        data['model'] = potential_model
-        
-        # Поиск типа топлива
-        fuel_patterns = [
-            r'БЕНЗИН', r'DIESEL', r'ДИЗЕЛЬ', r'ЕЛЕКТРО', r'ELECTRIC', r'ГАЗ', r'LPG'
-        ]
-        for pattern in fuel_patterns:
-            if re.search(pattern, text):
-                if 'БЕНЗИН' in pattern or 'PETROL' in pattern:
-                    data['fuel_type'] = 'бензин'
-                elif 'ДИЗЕЛЬ' in pattern or 'DIESEL' in pattern:
-                    data['fuel_type'] = 'дизель'
-                elif 'ЕЛЕКТРО' in pattern or 'ELECTRIC' in pattern:
-                    data['fuel_type'] = 'электро'
-                elif 'ГАЗ' in pattern or 'LPG' in pattern:
-                    data['fuel_type'] = 'газ'
+                    if not re.match(r'^\d{3,4}$', potential_model):
+                        result["model"] = potential_model
                 break
         
-        return data
+        # Поиск года
+        year_match = re.search(r'\b(19[8-9]\d|20[0-2]\d)\b', text)
+        if year_match:
+            result["year"] = year_match.group(1)
+        
+        return result
     
-    def process_document_photo(self, image_bytes):
-        """Основная функция обработки фото документа"""
-        try:
-            # Извлекаем текст
-            text = self.extract_text(image_bytes)
-            if not text:
-                return None, "Не удалось распознать текст с изображения"
-            
-            # Извлекаем данные о ТС
-            vehicle_data = self.extract_vehicle_data(text)
-            
-            # Проверяем, что получили хотя бы минимальные данные
-            if not vehicle_data['engine_volume'] and not vehicle_data['brand']:
-                return None, "Не удалось извлечь данные о транспортном средстве. Попробуйте загрузить более четкое фото."
-            
-            return vehicle_data, None
-            
-        except Exception as e:
-            return None, f"Ошибка обработки изображения: {str(e)}"
-    
-    def validate_data(self, data):
-        """Валидация извлеченных данных"""
-        errors = []
+    def extract_missing_data(self, current_data: Dict[str, Any], user_message: str) -> Dict[str, Any]:
+        """Извлекает недостающие данные из сообщения пользователя"""
+        message_data = self.parse_text_input(user_message)
         
-        if data['year']:
-            year = int(data['year'])
-            if year < 1990 or year > 2025:
-                errors.append("Некорректный год выпуска")
+        # Обновляем текущие данные новыми
+        for key, value in message_data.items():
+            if value and (not current_data.get(key) or key == "engine_volume"):
+                current_data[key] = value
         
-        if data['engine_volume']:
-            try:
-                volume = int(data['engine_volume'])
-                if volume < 50 or volume > 10000:
-                    errors.append("Некорректный объем двигателя")
-            except:
-                errors.append("Некорректный формат объема двигателя")
-        
-        return errors
+        return current_data

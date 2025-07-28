@@ -1,23 +1,17 @@
 import base64
 import re
 import json
-from anthropic import Anthropic
 import os
 from typing import Optional, Dict, Any
 
+# Временно закомментируем Anthropic до решения проблем с версией
+# from anthropic import Anthropic
+
 class ClaudeProcessor:
     def __init__(self):
-        # Инициализация Claude API
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key:
-            # Не вызываем ошибку при инициализации, проверим позже
-            self.client = None
-        else:
-            try:
-                self.client = Anthropic(api_key=api_key)
-            except Exception as e:
-                print(f"Ошибка инициализации Anthropic: {e}")
-                self.client = None
+        # Временно отключаем Claude API
+        self.client = None
+        print("Claude API временно отключен - используем только текстовый парсинг")
         
         # Известные марки автомобилей для валидации
         self.car_brands = [

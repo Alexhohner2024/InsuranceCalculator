@@ -10,9 +10,14 @@ class ClaudeProcessor:
         # Инициализация Claude API
         api_key = os.getenv('ANTHROPIC_API_KEY')
         if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY не найден в переменных окружения")
-        
-        self.client = Anthropic(api_key=api_key)
+            # Не вызываем ошибку при инициализации, проверим позже
+            self.client = None
+        else:
+            try:
+                self.client = Anthropic(api_key=api_key)
+            except Exception as e:
+                print(f"Ошибка инициализации Anthropic: {e}")
+                self.client = None
         
         # Известные марки автомобилей для валидации
         self.car_brands = [

@@ -28,99 +28,16 @@ class ClaudeProcessor:
         return base64.b64encode(image_bytes).decode('utf-8')
     
     async def analyze_document(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Анализирует документ через Claude API"""
-        if not self.client:
-            return {"error": "Claude API не инициализирован. Проверьте ANTHROPIC_API_KEY."}
-        
-        try:
-            # Кодируем изображение
-            base64_image = self.encode_image(image_bytes)
-            
-            # Создаем промпт для анализа техпаспорта
-            prompt = """
-Проанализируй украинский техпаспорт на изображении и извлеки данные о транспортном средстве.
-
-Верни результат в формате JSON с полями:
-{
-  "brand": "марка автомобиля (например BMW, TOYOTA)",
-  "model": "модель (например X3, Camry)", 
-  "year": "год выпуска (4 цифры)",
-  "engine_volume": "объем двигателя в см³ (только цифры, например 1998)",
-  "confidence": "уверенность в правильности данных от 0 до 100"
-}
-
-Важные моменты:
-- Ищи объем двигателя рядом с полями P.1, Capacity, "см³", "см3"
-- Марка может быть в полях D.1, Make, Марка
-- Модель в полях D.2, Type, Тип
-- Год в полях B.2, Year, Рік випуску
-- Если какое-то поле не найдено, укажи null
-- Объем двигателя критично важен для расчета страховки
-
-Верни только JSON, без дополнительного текста.
-            """
-            
-            # Отправляем запрос к Claude
-            response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=300,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/jpeg",
-                                    "data": base64_image
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
-            )
-            
-            # Парсим ответ
-            response_text = response.content[0].text.strip()
-            
-            # Извлекаем JSON из ответа
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                return result
-            else:
-                return {"error": "Не удалось получить структурированный ответ от API"}
-                
-        except json.JSONDecodeError as e:
-            return {"error": f"Ошибка парсинга JSON: {str(e)}"}
-        except Exception as e:
-            return {"error": f"Ошибка API: {str(e)}"}
+        """Временно отключен анализ фото - используем только текст"""
+        return {
+            "error": "Анализ фото временно недоступен. Пожалуйста, введите данные текстом: 'BMW X3 1998 см³'"
+        }
     
     async def analyze_multiple_images(self, images: list) -> Dict[str, Any]:
-        """Анализ нескольких изображений (обе стороны техпаспорта)"""
-        all_data = {}
-        best_confidence = 0
-        
-        for i, image_bytes in enumerate(images):
-            result = await self.analyze_document(image_bytes)
-            
-            if "error" not in result:
-                confidence = result.get("confidence", 0)
-                if confidence > best_confidence:
-                    all_data = result
-                    best_confidence = confidence
-                else:
-                    # Дополняем данные из других фото
-                    for key, value in result.items():
-                        if key != "confidence" and value and not all_data.get(key):
-                            all_data[key] = value
-        
-        return all_data if all_data else {"error": "Не удалось извлечь данные ни с одного изображения"}
+        """Анализ нескольких изображений - временно отключен"""
+        return {
+            "error": "Анализ фото временно недоступен. Введите данные текстом: 'марка модель объем_двигателя'"
+        }
     
     def parse_text_input(self, text: str) -> Dict[str, Any]:
         """Парсит текстовый ввод пользователя"""
